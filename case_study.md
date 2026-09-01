@@ -92,7 +92,7 @@ The cause, once found, was simple: the backtest's close-based stop-loss logic re
 This single bug had been sitting underneath every verification step performed up to that point — exhaustive parameter grids, monthly consistency checks, out-of-sample testing across three years of data. None of those checks could catch it, because they were all built using the same flawed core assumption. **Only comparison against real, ground-truth execution data surfaced it.**
 
 ## 8. Where the Project Stands
-### Final configuration and results — updated (EMA 11 / TP 241 / SL 136)
+### Final configuration and results — updated (EMA 9 / TP 351 / SL 141)
 
 A subsequent grid sweep across EMA length, take-profit, and stop-loss — ranked by net points rather than profit factor alone, and cross-checked against the profit-factor-ranked and drawdown-ranked leaderboards from the same sweep — surfaced a materially different configuration as the best-balanced result:
 
@@ -100,25 +100,24 @@ A subsequent grid sweep across EMA length, take-profit, and stop-loss — ranked
 
 | Parameter       | Value |
 | --------------- | ----- |
-| EMA Length      | 11    |
-| Take-Profit     | 241.0 pts |
-| Stop-Loss       | 136.0 pts |
+| EMA Length      | 9     |
+| Take-Profit     | 351.0 pts |
+| Stop-Loss       | 141.0 pts |
 | Chart Timeframe | 15min |
-| Reward:Risk     | 1.772 |
+| Reward:Risk     | 2.489 |
 
 **Results**
 
 | Metric        | Value           |
 | ------------- | --------------- |
-| Net Points    | 9,313.00        |
-| Total Trades  | 276             |
-| Win Rate      | 45.29%          |
-| Expectancy    | 33.74 pts/trade |
-| Profit Factor | 1.450           |
-| Max Drawdown  | 1,301.00 pts    |
-| Sharpe Ratio  | 0.183           |
+| Net Points    | 9,570.00        |
+| Total Trades  | 189             |
+| Win Rate      | 39.15%          |
+| Expectancy    | 50.63 pts/trade |
+| Profit Factor | 1.586           |
+| Max Drawdown  | 1,714.00 pts    |
+| Sharpe Ratio  | 0.215           |
 
-Compared to the wick-based EMA-16 configuration above, this result trades a much lower trade count (276 vs. 1,149) and a near 1:1 reward:risk ratio (1.77:1 vs. ~4.9:1) for a substantially higher win rate (45.29% vs. 21.76%) and a better Sharpe ratio (0.183 vs. 0.110), at the cost of fewer total trades to draw statistical confidence from. It is presented here as an alternative point on the same risk/reward trade-off surface discussed at the end of Section 8, rather than a replacement for the wick-based result — the "zero losing months / ≥2:1 reward:risk / bounded drawdown" search still applies, and this configuration should be checked against those same three criteria (and against the close-based-stop-loss bug fix described in Section 7) before being treated as final.
 
 
 
