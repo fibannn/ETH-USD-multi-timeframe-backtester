@@ -1,438 +1,237 @@
-import argparse
-from pathlib import Path
+"""
+Finds the EMA_LENGTH / TP_POINTS / SL_POINTS combination with the best
+PROFIT FACTOR (gross profit / gross loss).
+
+TP and SL sweep the full 1-300 range independently. EMA_LENGTH sweeps
+whatever list you set in EMA_LENGTHS_OVERRIDE below - put one value in
+that list to keep EMA fixed, or several to sweep it too.
+
+Run this from the same folder as this script (BACKTESTER_PATH below
+points at the actual backtester file):
+    python find_best_profit_factor_ETH.py
+"""
+
+import importlib.util
+import pathlib
+import time
+import warnings
+from datetime import datetime
+from itertools import product
+
 import numpy as np
 import pandas as pd
-from numba import njit
-import itertools
-from datetime import datetime
-import warnings
+
 warnings.filterwarnings('ignore')
 
+# ------------------------------------------------------------
+# Load backtester ETH-USD.py by path (space in the filename means
+# it can't be `import`-ed normally).
+# ------------------------------------------------------------
+BACKTESTER_PATH = r"C:\Users\User\Desktop\backtester ETH-USD.py"
+
+SCRIPT_PATH = pathlib.Path(BACKTESTER_PATH)
+if not SCRIPT_PATH.exists():
+    raise FileNotFoundError(
+        f"Can't find the backtester at: {SCRIPT_PATH}\n"
+        f"Update BACKTESTER_PATH near the top of this file to its full path."
+    )
+_spec = importlib.util.spec_from_file_location("backtester_eth", SCRIPT_PATH)
+bt = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(bt)
 
 # ============================================================
-# SETTINGS - ALL FILTERS OFF (FIXED PNL)
+# SEARCH RANGES - edit these to taste
+#
+# TP and SL sweep the FULL 1-300 range. STEP controls the resolution:
+# STEP=1 tests every single value. Raise STEP to go faster.
 # ============================================================
 
+# EMA lengths to test. Put ONE value here to keep EMA fixed (e.g. [16]),
+# or several to sweep it too (e.g. [8, 12, 16, 20, 24, 32]).
+# None = use whatever EMA_LENGTH is already set in the backtester (fixed).
+EMA_LENGTHS_OVERRIDE = list(range(1, 105))  # [8, 12, 16, 20, 24, 32] or None
 
-DATASET_PATH = r"C:\Users\User\Desktop\python proj\DATASET ETH (30MONTHS)"
-TIMEZONE = "Asia/Kolkata"
-CHART_TIMEFRAME = "15min"  # 15-MINUTE CHART
+TP_STEP = 5
+SL_STEP = 5
 
+TP_POINTS_RANGE = list(range(1, 501, TP_STEP))
+SL_POINTS_RANGE = list(range(1, 501, SL_STEP))
 
-# Fixed parameters
-EMA_1H_LENGTH = 100
+MIN_TRADES = 200     # ignore combos with too few trades - a "great" profit
+                     # factor from 5 trades is noise, not a real edge
+TOP_N = 15            # how many rows to print in the leaderboard (kept for CSV / future use)
 
+# Only test combos with TP_POINTS/SL_POINTS >= this. RR < 1 means your
+# stop is bigger than your target, which pushes the breakeven win rate
+# above 50% - set to 1.0 to require at least a 1:1 reward:risk.
+MIN_RR_RATIO = 0
 
-# ALL FILTERS TURNED OFF
-USE_EMA_TOUCH_FILTER = False
-EMA_TOUCH_THRESHOLD = 0.2
-USE_SESSION_FILTER = False
-USE_1H_TREND_FILTER = False
-USE_VOLATILITY_FILTER = False  # TURNED OFF
-USE_TIMEOUT_FILTER = False
-TIMEOUT_BARS = 90
+# Safety valve: if your STEP/EMA settings would still produce a huge grid,
+# this warns you (rather than silently running for a long time) before starting.
+WARN_ABOVE_COMBOS = 200_000
 
-# Commission and slippage (in points) - FIXES PROFIT DISCREPANCY
-COMMISSION = 0.5  # points per trade
-SLIPPAGE = 0.5    # points per trade
-TOTAL_COST = COMMISSION + SLIPPAGE  # 1.0 point total cost per trade
+EMA_LENGTHS = list(EMA_LENGTHS_OVERRIDE) if EMA_LENGTHS_OVERRIDE else [bt.EMA_LENGTH]
 
-
-# EMA LENGTHS TO TEST
-EMA_LENGTHS = [5, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 30, 35, 40, 45, 50]
-
-
-# TP/SL TO TEST (in points)
-TP_VALUES = [100, 120, 140, 150, 160, 170, 180, 185, 190, 200, 210, 220, 230, 240, 250, 260, 270, 280, 290, 300]
-SL_VALUES = [15, 20, 25, 28, 30, 32, 35, 38, 40, 42, 45, 48, 50, 55, 60]
-
-
-# Total combinations: 24 EMA * 20 TP * 15 SL = 7,200 combinations
-
-
-# ============================================================
-# DATA LOADING
-# ============================================================
-
-
-BINANCE_COLUMNS = [
-    "open_time", "open", "high", "low", "close", "volume",
-    "close_time", "quote_volume", "trades", "taker_buy_base",
-    "taker_buy_quote", "ignore",
-]
-
-
-def detect_timestamp_unit(series):
-    values = pd.to_numeric(series, errors="coerce").dropna().abs()
-    median_value = values.median()
-    if median_value < 1e11:
-        return "s"
-    if median_value < 1e14:
-        return "ms"
-    if median_value < 1e17:
-        return "us"
-    return "ns"
-
-
-def load_one_file(file_path):
-    print(f"Loading: {file_path.name}", end="\r")
-    df = pd.read_csv(file_path, header=None, sep=None, engine="python")
-    if df.shape[1] < 6:
-        raise ValueError("File must contain horizontal OHLCV data.")
-    first_value = str(df.iloc[0, 0]).strip().lower()
-    if first_value in {"open_time", "open time", "timestamp", "time"}:
-        df = df.iloc[1:].reset_index(drop=True)
-    column_count = min(df.shape[1], len(BINANCE_COLUMNS))
-    df = df.iloc[:, :column_count].copy()
-    df.columns = BINANCE_COLUMNS[:column_count]
-    required = ["open_time", "open", "high", "low", "close", "volume"]
-    for column in required:
-        df[column] = pd.to_numeric(df[column], errors="coerce")
-    timestamp_unit = detect_timestamp_unit(df["open_time"])
-    df["time"] = pd.to_datetime(df["open_time"], unit=timestamp_unit, errors="coerce", utc=True)
-    df["time"] = df["time"].dt.tz_convert(TIMEZONE)
-    df = df.dropna(subset=["time", "open", "high", "low", "close", "volume"])
-    df = df.sort_values("time").drop_duplicates("time").set_index("time")
-    return df
-
-
-def load_dataset():
-    folder = Path(DATASET_PATH)
-    if not folder.exists():
-        raise FileNotFoundError(folder)
-    files = sorted(folder.glob("*.csv"))
-    files = [f for f in files if f.name not in {"trades_output.csv", "monthly_profit.csv", "combined_data.csv"}]
-    if not files:
-        raise FileNotFoundError("No CSV files found.")
-    print(f"Found {len(files)} CSV files.")
-    frames = []
-    for file_path in files:
-        try:
-            frames.append(load_one_file(file_path))
-        except Exception as e:
-            print(f"Skipped: {e}")
-    if not frames:
-        raise ValueError("No valid files were loaded.")
-    data = pd.concat(frames).sort_index()
-    data = data.loc[~data.index.duplicated(keep="first")]
-    print(f"Combined 1-minute data: {len(data):,} candles")
-    return data
-
-
-# ============================================================
-# RESAMPLING AND INDICATORS
 # ============================================================
 
 
-def resample_ohlc(data, timeframe):
-    return (data[["open", "high", "low", "close", "volume"]]
-            .resample(timeframe, label="right", closed="right")
-            .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
-            .dropna())
+def build_signals_for_ema(chart, closes_by_tf, ema_length):
+    """Recompute EMAs (cheap - just an ewm on already-resampled closes) and
+    the resulting buy/sell signals for one EMA_LENGTH candidate."""
+    data = chart.copy()
+    for tf_key, col_name in (("1min", "ema_1m"), ("5min", "ema_5m"),
+                              ("15min", "ema_15m"), ("30min", "ema_30m")):
+        ema = bt.calculate_ema(closes_by_tf[tf_key], ema_length)
+        data[col_name] = ema.reindex(chart.index, method="ffill")
+
+    data = data.dropna(subset=["ema_1m", "ema_5m", "ema_15m", "ema_30m"])
+    buy, sell, close, open_, high, low = bt.prepare_signals(data)
+    return data, buy, sell, open_, high, low
 
 
-def calculate_ema(series, length):
-    return series.ewm(span=length, adjust=False, min_periods=length).mean()
+def print_best_row(title, row):
+    """Pretty-print a single 'best' combo row (used for all three leaderboards)."""
+    print("\n" + "=" * 80)
+    print(title)
+    print("=" * 80)
+    print(f"  EMA_LENGTH:      {int(row['ema_length'])}")
+    print(f"  TP_POINTS:       {row['tp_points']}")
+    print(f"  SL_POINTS:       {row['sl_points']}")
+    print(f"  R:R:             {row['rr_ratio']}")
+    print(f"  Profit Factor:   {row['profit_factor']:.3f}")
+    print(f"  Total Trades:    {int(row['total_trades'])}")
+    print(f"  Win Rate:        {row['win_rate']:.2f}%")
+    print(f"  Expectancy:      {row['expectancy']:.2f} pts/trade")
+    print(f"  Net Points:      {row['net_points']:.2f}")
+    print(f"  Max Drawdown:    {row['max_drawdown']:.2f} pts")
+    print(f"  Sharpe Ratio:    {row['sharpe_ratio']:.3f}")
 
 
-def align_ema(source_data, chart_data, timeframe, length):
-    timeframe_data = resample_ohlc(source_data, timeframe)
-    ema = calculate_ema(timeframe_data["close"], length)
-    return ema.reindex(chart_data.index, method="ffill")
+def find_best_profit_factor():
+    print("=" * 80)
+    print("🔎 FIND BEST PROFIT FACTOR - ETH-USD")
+    print("   Sweeping EMA_LENGTH x TP_POINTS x SL_POINTS")
+    print("=" * 80)
+    print(f"  EMA_LENGTHS:        {EMA_LENGTHS}")
+    print(f"  TP_POINTS_RANGE:    {TP_POINTS_RANGE[0]}-{TP_POINTS_RANGE[-1]} step {TP_STEP} ({len(TP_POINTS_RANGE)} values)")
+    print(f"  SL_POINTS_RANGE:    {SL_POINTS_RANGE[0]}-{SL_POINTS_RANGE[-1]} step {SL_STEP} ({len(SL_POINTS_RANGE)} values)")
+    print(f"  MIN_TRADES:         {MIN_TRADES}")
+    print(f"  MIN_RR_RATIO:       {MIN_RR_RATIO}  (TP/SL must be >= this)")
 
+    tp_sl_combos = [(tp, sl) for tp, sl in product(TP_POINTS_RANGE, SL_POINTS_RANGE)
+                    if tp / sl >= MIN_RR_RATIO]
+    skipped = len(TP_POINTS_RANGE) * len(SL_POINTS_RANGE) - len(tp_sl_combos)
+    total_combos = len(EMA_LENGTHS) * len(tp_sl_combos)
+    print(f"  TP/SL combos:       {len(tp_sl_combos)}  ({skipped} skipped for RR < {MIN_RR_RATIO})")
+    print(f"  Total combos:       {total_combos}  (x {len(EMA_LENGTHS)} EMA lengths)")
+    print("=" * 80)
 
-def prepare_data(raw_1m, ema_length):
-    chart_15m = resample_ohlc(raw_1m, CHART_TIMEFRAME)
-    data = chart_15m.copy()
-    data["ema_1m"] = align_ema(raw_1m, data, "1min", ema_length)
-    data["ema_5m"] = align_ema(raw_1m, data, "5min", ema_length)
-    data["ema_15m"] = align_ema(raw_1m, data, "15min", ema_length)
-    data["ema_30m"] = align_ema(raw_1m, data, "30min", ema_length)
-    data["ema_1h"] = align_ema(raw_1m, data, "60min", EMA_1H_LENGTH)
-    data = data.dropna(subset=["ema_1m", "ema_5m", "ema_15m", "ema_30m", "ema_1h"])
-    return data
+    if total_combos > WARN_ABOVE_COMBOS:
+        print(f"\n⚠️  {total_combos:,} combos exceeds WARN_ABOVE_COMBOS ({WARN_ABOVE_COMBOS:,}).")
+        print("   This could take a very long time. Raise TP_STEP / SL_STEP, or shrink")
+        print("   EMA_LENGTHS_OVERRIDE, to reduce it - or press Enter to continue anyway.")
+        input("   Press Enter to proceed, or Ctrl+C to cancel...")
 
+    print("\nLoading dataset...")
+    raw_data = bt.load_dataset()
 
-# ============================================================
-# SIGNAL PREPARATION (ALL FILTERS OFF)
-# ============================================================
-
-
-def prepare_signals(data, ema_length):
-    close = data["close"].to_numpy()
-    open_price = data["open"].to_numpy()
-    high = data["high"].to_numpy()
-    low = data["low"].to_numpy()
-    ema_1m = data["ema_1m"].to_numpy()
-    ema_5m = data["ema_5m"].to_numpy()
-    ema_15m = data["ema_15m"].to_numpy()
-    ema_30m = data["ema_30m"].to_numpy()
-    ema_1h = data["ema_1h"].to_numpy()
-    number = len(data)
-    
-    bullish_1m = close > ema_1m
-    bullish_5m = close > ema_5m
-    bullish_15m = close > ema_15m
-    bullish_30m = close > ema_30m
-    bullish_1h = close > ema_1h
-    
-    bearish_1m = close < ema_1m
-    bearish_5m = close < ema_5m
-    bearish_15m = close < ema_15m
-    bearish_30m = close < ema_30m
-    bearish_1h = close < ema_1h
-    
-    # ALL BULLISH/BEARISH (no 1h filter)
-    all_bullish = bullish_1m & bullish_5m & bullish_15m & bullish_30m
-    all_bearish = bearish_1m & bearish_5m & bearish_15m & bearish_30m
-    
-    previous_bullish = np.roll(all_bullish, 1)
-    previous_bearish = np.roll(all_bearish, 1)
-    previous_bullish[:2] = False
-    previous_bearish[:2] = False
-    
-    close_1 = np.roll(close, 1)
-    close_2 = np.roll(close, 2)
-    ema_5m_1 = np.roll(ema_5m, 1)
-    ema_5m_2 = np.roll(ema_5m, 2)
-    
-    bull_confirm = (close_1 > ema_5m_1) & (close_2 > ema_5m_2)
-    bear_confirm = (close_1 < ema_5m_1) & (close_2 < ema_5m_2)
-    bull_confirm[:2] = False
-    bear_confirm[:2] = False
-    
-    # ALL FILTERS OFF - always True
-    candle_touches = np.ones(number, dtype=bool)
-    wick_ok = np.ones(number, dtype=bool)
-    bounce_bull = np.ones(number, dtype=bool)
-    bounce_bear = np.ones(number, dtype=bool)
-    session_ok = np.ones(number, dtype=bool)
-    volatility_ok = np.ones(number, dtype=bool)
-    
-    buy_signal = all_bullish & bull_confirm & candle_touches & bounce_bull & wick_ok & ~previous_bullish & session_ok & volatility_ok
-    sell_signal = all_bearish & bear_confirm & bounce_bear & wick_ok & ~previous_bearish & session_ok & volatility_ok
-    
-    return buy_signal, sell_signal, close, open_price, high, low
-
-
-# ============================================================
-# TRADE SIMULATOR (FIXED - WITH COMMISSION/SLIPPAGE)
-# ============================================================
-
-
-@njit(cache=True)
-def simulate(open_price, high, low, buy_signal, sell_signal, tp_points, sl_points, timeout_bars, use_timeout_filter, total_cost):
-    n = len(open_price)
-    trade_pnl = np.empty(n)
-    entry_indices = np.empty(n, dtype=np.int64)
-    exit_indices = np.empty(n, dtype=np.int64)
-    sides = np.empty(n, dtype=np.int64)
-    trade_count = 0
-    position = 0
-    entry_price = 0.0
-    entry_index = -1
-    timeout_counter = 0
-    for i in range(2, n - 1):
-        if position != 0:
-            if position == 1:
-                tp_price = entry_price + tp_points
-                sl_price = entry_price - sl_points
-                sl_hit = low[i] <= sl_price
-                tp_hit = high[i] >= tp_price
-                if sl_hit:
-                    trade_pnl[trade_count] = -sl_points - total_cost  # FIXED: Subtract cost
-                    entry_indices[trade_count] = entry_index
-                    exit_indices[trade_count] = i
-                    sides[trade_count] = 1
-                    trade_count += 1
-                    position = 0
-                elif tp_hit:
-                    trade_pnl[trade_count] = tp_points - total_cost  # FIXED: Subtract cost
-                    entry_indices[trade_count] = entry_index
-                    exit_indices[trade_count] = i
-                    sides[trade_count] = 1
-                    trade_count += 1
-                    position = 0
-            else:
-                tp_price = entry_price - tp_points
-                sl_price = entry_price + sl_points
-                sl_hit = high[i] >= sl_price
-                tp_hit = low[i] <= tp_price
-                if sl_hit:
-                    trade_pnl[trade_count] = -sl_points - total_cost  # FIXED: Subtract cost
-                    entry_indices[trade_count] = entry_index
-                    exit_indices[trade_count] = i
-                    sides[trade_count] = -1
-                    trade_count += 1
-                    position = 0
-                elif tp_hit:
-                    trade_pnl[trade_count] = tp_points - total_cost  # FIXED: Subtract cost
-                    entry_indices[trade_count] = entry_index
-                    exit_indices[trade_count] = i
-                    sides[trade_count] = -1
-                    trade_count += 1
-                    position = 0
-        if timeout_counter > 0:
-            timeout_counter -= 1
-        timeout_active = use_timeout_filter and timeout_counter > 0
-        if position == 0 and not timeout_active:
-            if buy_signal[i]:
-                position = 1
-                entry_index = i + 1
-                entry_price = open_price[i + 1]
-            elif sell_signal[i]:
-                position = -1
-                entry_index = i + 1
-                entry_price = open_price[i + 1]
-        if position == 0 and use_timeout_filter:
-            if trade_count > 0:
-                timeout_counter = timeout_bars
-    return trade_pnl[:trade_count], entry_indices[:trade_count], exit_indices[:trade_count], sides[:trade_count]
-
-
-# ============================================================
-# METRICS
-# ============================================================
-
-
-def calculate_metrics(pnl):
-    if len(pnl) == 0:
-        return {"total_trades": 0, "win_rate": 0.0, "net_points": 0.0, "expectancy": 0.0, "profit_factor": 0.0, "max_drawdown": 0.0, "avg_win": 0.0, "avg_loss": 0.0, "largest_win": 0.0, "largest_loss": 0.0, "sharpe_ratio": 0.0}
-    wins = pnl[pnl > 0]
-    losses = pnl[pnl < 0]
-    gross_profit = wins.sum()
-    gross_loss = abs(losses.sum())
-    equity = np.cumsum(pnl)
-    drawdown = np.maximum.accumulate(equity) - equity
-    returns = np.diff(equity)
-    sharpe = np.sqrt(252) * returns.mean() / returns.std() if returns.std() > 0 else 0.0
-    return {
-        "total_trades": len(pnl),
-        "win_rate": len(wins) / len(pnl) * 100 if len(pnl) > 0 else 0.0,
-        "net_points": pnl.sum(),
-        "expectancy": pnl.mean() if len(pnl) > 0 else 0.0,
-        "profit_factor": gross_profit / gross_loss if gross_loss > 0 else np.inf,
-        "max_drawdown": drawdown.max() if len(drawdown) > 0 else 0.0,
-        "avg_win": wins.mean() if len(wins) > 0 else 0.0,
-        "avg_loss": abs(losses.mean()) if len(losses) > 0 else 0.0,
-        "largest_win": wins.max() if len(wins) > 0 else 0.0,
-        "largest_loss": losses.min() if len(losses) > 0 else 0.0,
-        "sharpe_ratio": sharpe,
+    print("Resampling once per timeframe (reused across every EMA length)...")
+    chart = bt.resample_ohlc(raw_data, bt.CHART_TIMEFRAME)
+    closes_by_tf = {
+        "1min": bt.resample_ohlc(raw_data, "1min")["close"],
+        "5min": bt.resample_ohlc(raw_data, "5min")["close"],
+        "15min": bt.resample_ohlc(raw_data, "15min")["close"],
+        "30min": bt.resample_ohlc(raw_data, "30min")["close"],
     }
 
+    # 1-minute arrays for the intrabar TP/SL tie-break - computed once,
+    # reused across every EMA/TP/SL combo (only the bar-range mapping
+    # below needs recomputing per EMA length, since dropna shifts rows).
+    open_1m = raw_data["open"].to_numpy()
+    high_1m = raw_data["high"].to_numpy()
+    low_1m = raw_data["low"].to_numpy()
+    close_1m = raw_data["close"].to_numpy()
 
-# ============================================================
-# OPTIMIZATION
-# ============================================================
-
-
-def run_optimization():
-    print("=" * 80)
-    print("🏆 CHAMPION PARAMETER OPTIMIZATION (ALL FILTERS OFF)")
-    print("=" * 80)
-    print(f"\n⚙️  Fixed Settings:")
-    print(f"  CHART_TIMEFRAME: {CHART_TIMEFRAME}")
-    print(f"  EMA_1H_LENGTH: {EMA_1H_LENGTH}")
-    print(f"  COMMISSION: {COMMISSION} points")
-    print(f"  SLIPPAGE: {SLIPPAGE} points")
-    print(f"  TOTAL COST: {TOTAL_COST} points per trade")
-    print(f"\n🔍 Parameter Ranges:")
-    print(f"  EMA_LENGTH: {len(EMA_LENGTHS)} values [{min(EMA_LENGTHS)}-{max(EMA_LENGTHS)}]")
-    print(f"  TP_POINTS: {len(TP_VALUES)} values [{min(TP_VALUES)}-{max(TP_VALUES)}]")
-    print(f"  SL_POINTS: {len(SL_VALUES)} values [{min(SL_VALUES)}-{max(SL_VALUES)}]")
-    total_combos = len(EMA_LENGTHS) * len(TP_VALUES) * len(SL_VALUES)
-    print(f"\n💥 Total Combinations: {total_combos:,}")
-    print("=" * 80)
-    
-    print("\nLoading dataset...")
-    raw_data = load_dataset()
-    
-    combinations = list(itertools.product(EMA_LENGTHS, TP_VALUES, SL_VALUES))
-    print(f"\nTesting {len(combinations):,} combinations...\n")
-    
+    print("\nRunning sweep...")
+    start_time = time.time()
     results = []
-    
-    for idx, (ema_len, tp, sl) in enumerate(combinations, 1):
-        print(f"[{idx:5d}/{total_combos:,}] EMA={ema_len:2d}, TP={tp:3d}, SL={sl:2d}", end="\r")
-        
-        try:
-            data = prepare_data(raw_data, ema_len)
-            buy_signal, sell_signal, close, open_price, high, low = prepare_signals(data, ema_len)
-            pnl, entry_indices, exit_indices, sides = simulate(
-                open_price, high, low, buy_signal, sell_signal,
-                tp, sl, TIMEOUT_BARS, USE_TIMEOUT_FILTER, TOTAL_COST
+    i = 0
+    for ema_length in EMA_LENGTHS:
+        print(f"\n--- EMA_LENGTH = {ema_length} ---")
+        data, buy, sell, open_, high, low = build_signals_for_ema(chart, closes_by_tf, ema_length)
+        print(f"  {int(buy.sum())} buy signals, {int(sell.sum())} sell signals over {len(data):,} bars")
+
+        # Bar-range mapping depends on which rows survived this EMA's
+        # dropna, so it's recomputed per EMA length (cheap - vectorized).
+        bar_1m_start, bar_1m_end = bt.compute_1m_bar_ranges(data.index, raw_data.index, bt.CHART_TIMEFRAME)
+
+        for tp, sl in tp_sl_combos:
+            i += 1
+            pnl, entry_idx, exit_idx, sides, exit_reasons = bt.simulate(
+                open_, high, low, buy, sell, float(tp), float(sl), bt.TOTAL_COST,
+                bar_1m_start, bar_1m_end, open_1m, high_1m, low_1m, close_1m,
+                bt.MIN_ENTRY_GAP_BARS, bt.USE_1M_TIE_BREAK
             )
-            metrics = calculate_metrics(pnl)
-            results.append({
-                "ema_length": ema_len,
-                "tp_points": tp,
-                "sl_points": sl,
-                **metrics
-            })
-        except Exception as e:
-            continue
-    
-    print("\n\n")
-    
+            metrics = bt.calculate_metrics(pnl, exit_reasons)
+            if metrics["total_trades"] >= MIN_TRADES:
+                results.append({
+                    "ema_length": ema_length,
+                    "tp_points": tp,
+                    "sl_points": sl,
+                    "rr_ratio": round(tp / sl, 3),
+                    **metrics,
+                })
+
+            if i == 20 or (i % 500 == 0) or i == total_combos:
+                elapsed = time.time() - start_time
+                rate = i / elapsed if elapsed > 0 else 0
+                remaining = (total_combos - i) / rate if rate > 0 else 0
+                print(f"  {i:,}/{total_combos:,} combos "
+                      f"({elapsed:,.1f}s elapsed, ~{remaining:,.1f}s remaining, "
+                      f"{rate:,.0f} combos/s)", end="\r" if i != total_combos else "\n")
+
     if not results:
-        print("No valid results found!")
+        print("\n⚠️  No combo produced at least MIN_TRADES trades - widen your ranges or lower MIN_TRADES.")
         return None
-    
+
     results_df = pd.DataFrame(results)
-    
-    # Composite score
-    results_df["score"] = (
-        results_df["net_points"].rank(pct=True) * 0.5 +
-        (1 - results_df["max_drawdown"].rank(pct=True)) * 0.3 +
-        results_df["expectancy"].rank(pct=True) * 0.2
-    )
-    
-    results_df = results_df.sort_values(
-        by=["net_points", "max_drawdown", "expectancy"],
-        ascending=[False, True, False]
-    ).reset_index(drop=True)
-    
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = f"champion_optimization_{len(combinations):,}_combinations_{timestamp}.csv".replace(",", "")
-    results_df.to_csv(output_file, index=False)
-    
-    # Display results
-    print("=" * 80)
-    print("🏆 TOP 20 CHAMPION COMBINATIONS")
-    print("=" * 80)
-    display_cols = ["ema_length", "tp_points", "sl_points", "net_points", "max_drawdown", "total_trades", "win_rate", "expectancy", "profit_factor", "sharpe_ratio"]
-    print(results_df[display_cols].head(20).to_string(index=False))
-    
-    best = results_df.iloc[0]
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_file = f"eth_best_profit_factor_{ts}.csv"
+    results_df.sort_values("profit_factor", ascending=False).to_csv(out_file, index=False)
+    print(f"\n✅ Full grid ({len(results_df)} qualifying combos) saved to: {out_file}")
+
+    # At very small TP values, a trade's profit can be smaller than
+    # COMMISSION+SLIPPAGE, so every trade nets exactly 0 P&L: 0 wins, 0
+    # losses, and profit_factor's gross_profit/gross_loss becomes inf/inf
+    # by the fallback rule. That's a breakeven artifact, not a real edge -
+    # exclude it from the ranked leaderboard (it's still in the saved CSV).
+    ranked_df = results_df[results_df["win_rate"] > 0].copy()
+    if ranked_df.empty:
+        print("\n⚠️  Every qualifying combo had a 0% win rate (likely TP too small to")
+        print("   clear commission+slippage) - nothing meaningful to rank. Check the")
+        print("   saved CSV, or raise MIN_TRADES / narrow the TP range.")
+        return results_df
+
+    # ------------------------------------------------------------
+    # Three separate "top pick" leaderboards - each just the single
+    # best combo by that metric, not a top-N table.
+    # ------------------------------------------------------------
+    best_pf = ranked_df.sort_values("profit_factor", ascending=False).iloc[0]
+    best_net_points = ranked_df.sort_values("net_points", ascending=False).iloc[0]
+    # max_drawdown is a magnitude of loss - "least drawdown" = smallest value
+    best_drawdown = ranked_df.sort_values("max_drawdown", ascending=True).iloc[0]
+
+    print_best_row("🏆 TOP PICK - BEST PROFIT FACTOR", best_pf)
+    print_best_row("💰 TOP PICK - BEST NET POINTS", best_net_points)
+    print_best_row("🛡️  TOP PICK - LEAST MAX DRAWDOWN", best_drawdown)
+
     print("\n" + "=" * 80)
-    print("🥇 #1 CHAMPION COMBINATION")
-    print("=" * 80)
-    print(f"EMA_LENGTH:  {int(best['ema_length'])}")
-    print(f"TP_POINTS:   {int(best['tp_points'])}")
-    print(f"SL_POINTS:   {int(best['sl_points'])}")
-    print(f"\n📊 Performance:")
-    print(f"  Net Points:    {best['net_points']:.2f}")
-    print(f"  Max Drawdown:  {best['max_drawdown']:.2f}")
-    print(f"  Total Trades:  {int(best['total_trades'])}")
-    print(f"  Win Rate:      {best['win_rate']:.2f}%")
-    print(f"  Expectancy:    {best['expectancy']:.2f}")
-    print(f"  Profit Factor: {best['profit_factor']:.2f}")
-    print(f"  Sharpe Ratio:  {best['sharpe_ratio']:.3f}")
-    print(f"  Avg Win:       {best['avg_win']:.2f}")
-    print(f"  Avg Loss:      {best['avg_loss']:.2f}")
-    
-    print("\n" + "=" * 80)
-    print("🥈 TOP 5 DETAILED RESULTS")
-    print("=" * 80)
-    for i in range(min(5, len(results_df))):
-        row = results_df.iloc[i]
-        print(f"\n#{i+1}: EMA={int(row['ema_length']):2d}, TP={int(row['tp_points']):3d}, SL={int(row['sl_points']):2d}")
-        print(f"    Net: {row['net_points']:8.2f} | DD: {row['max_drawdown']:6.2f} | Trades: {int(row['total_trades']):4d} | Win%: {row['win_rate']:5.2f} | Exp: {row['expectancy']:6.2f} | PF: {row['profit_factor']:5.2f} | Sharpe: {row['sharpe_ratio']:.3f}")
-    
-    print(f"\n✅ All {len(combinations):,} results saved to: {output_file}")
-    
-    return results_df
+
+    # Return the PF-ranked frame (kept for backward compatibility with any
+    # calling code that expects a DataFrame back).
+    return ranked_df.sort_values("profit_factor", ascending=False).reset_index(drop=True)
 
 
 if __name__ == "__main__":
-    results = run_optimization()
+    find_best_profit_factor()
