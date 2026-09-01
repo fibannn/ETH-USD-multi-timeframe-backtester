@@ -15,18 +15,31 @@ DATASET_PATH = r"C:\Users\User\Desktop\python proj\DATASET ETH (30MONTHS)"
 TIMEZONE = "Asia/Kolkata"
 CHART_TIMEFRAME = "15min"  # Your strategy chart timeframe
 
-EMA_LENGTH = 16
-TP_POINTS = 166.0
-SL_POINTS = 34.0
+EMA_LENGTH = 11
+TP_POINTS = 241
+SL_POINTS = 136
+MIN_ENTRY_GAP_BARS = 0  # 1 hour on the 15-minute chart
 
-COMMISSION = 0.0
+COMMISSION = 0.5
 SLIPPAGE = 0.5
 TOTAL_COST = COMMISSION + SLIPPAGE
 
 # New tuned parameters
-MAX_WICK_RATIO = 0.94       # was 0.7
+MAX_WICK_RATIO = 0.94       # was 0.94
 BULL_BOUNCE_MULT = 1.0018   # was 1.003
 BEAR_BOUNCE_MULT = 0.9982   # was 0.997
+
+# ------------------------------------------------------------
+# Same-bar TP/SL resolution.
+# True  = when a 15-min bar touches BOTH TP and SL, drop down to the
+#         underlying 1-minute candles and use whichever level was
+#         ACTUALLY touched first in real chronological order (falls
+#         back to a bar-direction heuristic only on the rare 1-min
+#         candle that itself touches both levels).
+# False = old behaviour: SL always wins same-bar ties (conservative,
+#         but can understate performance on wide-TP/tight-SL combos).
+# ------------------------------------------------------------
+USE_1M_TIE_BREAK = True
 
 # ============================================================
 # DATA LOADING
@@ -128,6 +141,18 @@ def prepare_data(raw_1m):
     data = data.dropna(subset=["ema_1m", "ema_5m", "ema_15m", "ema_30m"])
     return data
 
+
+def compute_1m_bar_ranges(chart_index, raw_index, timeframe):
+    """For every chart (15-min) bar, find the index range [start, end) into
+    the raw 1-minute arrays that make up that bar, in chronological order.
+    Matches resample_ohlc's label='right', closed='right' convention:
+    a chart bar timestamped T covers 1-min candles with time in (T-15min, T]."""
+    tf_delta = pd.Timedelta(timeframe)
+    bar_start_time = chart_index - tf_delta
+    start_idx = raw_index.searchsorted(bar_start_time, side="right")
+    end_idx = raw_index.searchsorted(chart_index, side="right")
+    return start_idx.astype(np.int64), end_idx.astype(np.int64)
+
 # ============================================================
 # SIGNAL LOGIC (UPDATED TO MATCH NEW STRATEGY)
 # trend stack + 5m confirm + bounce (1.0018 / 0.9982) + wick < 0.94
@@ -190,13 +215,54 @@ def prepare_signals(data):
     return buy_condition, sell_condition, close, open_price, high, low
 
 # ============================================================
-# TRADE SIMULATOR (TP/SL ONLY)
-# Same entry/exit logic as before
+# INTRABAR (1-MINUTE) TIE-BREAK
 # ============================================================
 
 
 @njit(cache=True)
-def simulate(open_price, high, low, buy_signal, sell_signal, tp_points, sl_points, total_cost):
+def resolve_order_1m(start_idx, end_idx, open_1m, high_1m, low_1m, close_1m, tp_price, sl_price, is_long):
+    """Walk the 1-minute candles that make up one ambiguous 15-min bar, in
+    chronological order, and return 1 if TP was touched first, 2 if SL was
+    touched first. If a single 1-min candle touches both (rare), fall back
+    to a bar-direction heuristic: green candle (close>=open) assumes the
+    path went low-before-high; red candle assumes high-before-low."""
+    for j in range(start_idx, end_idx):
+        o = open_1m[j]
+        h = high_1m[j]
+        l = low_1m[j]
+        c = close_1m[j]
+        if is_long:
+            sl_touch = l <= sl_price
+            tp_touch = h >= tp_price
+        else:
+            sl_touch = h >= sl_price
+            tp_touch = l <= tp_price
+
+        if sl_touch and tp_touch:
+            if c >= o:
+                # green candle: assumed path open->low->high->close
+                return 2 if is_long else 1
+            else:
+                # red candle: assumed path open->high->low->close
+                return 1 if is_long else 2
+        elif sl_touch:
+            return 2
+        elif tp_touch:
+            return 1
+
+    # Shouldn't normally be reached (the 15-min high/low guarantees a touch
+    # exists somewhere in these candles) - conservative fallback.
+    return 2
+
+# ============================================================
+# TRADE SIMULATOR (TP/SL ONLY)
+# ============================================================
+
+
+@njit(cache=True)
+def simulate(open_price, high, low, buy_signal, sell_signal, tp_points, sl_points, total_cost,
+             bar_1m_start, bar_1m_end, open_1m, high_1m, low_1m, close_1m,
+             min_entry_gap_bars, use_1m_tie_break):
     n = len(open_price)
     trade_pnl = np.empty(n)
     entry_indices = np.empty(n, dtype=np.int64)
@@ -207,62 +273,62 @@ def simulate(open_price, high, low, buy_signal, sell_signal, tp_points, sl_point
     position = 0
     entry_price = 0.0
     entry_index = -1
+    last_entry_index = -min_entry_gap_bars
 
     for i in range(2, n - 1):
         if position != 0:
-            if position == 1:
+            is_long = position == 1
+            if is_long:
                 tp_price = entry_price + tp_points
                 sl_price = entry_price - sl_points
                 sl_hit = low[i] <= sl_price
                 tp_hit = high[i] >= tp_price
-                if sl_hit:
-                    trade_pnl[trade_count] = -sl_points - total_cost
-                    entry_indices[trade_count] = entry_index
-                    exit_indices[trade_count] = i
-                    sides[trade_count] = 1
-                    exit_reasons[trade_count] = 2
-                    trade_count += 1
-                    position = 0
-                elif tp_hit:
-                    trade_pnl[trade_count] = tp_points - total_cost
-                    entry_indices[trade_count] = entry_index
-                    exit_indices[trade_count] = i
-                    sides[trade_count] = 1
-                    exit_reasons[trade_count] = 1
-                    trade_count += 1
-                    position = 0
             else:
                 tp_price = entry_price - tp_points
                 sl_price = entry_price + sl_points
                 sl_hit = high[i] >= sl_price
                 tp_hit = low[i] <= tp_price
-                if sl_hit:
+
+            exit_reason = 0  # 0 = no exit this bar
+            if sl_hit and tp_hit:
+                if use_1m_tie_break and bar_1m_end[i] > bar_1m_start[i]:
+                    exit_reason = resolve_order_1m(
+                        bar_1m_start[i], bar_1m_end[i],
+                        open_1m, high_1m, low_1m, close_1m,
+                        tp_price, sl_price, is_long
+                    )
+                else:
+                    exit_reason = 2  # conservative fallback: SL wins
+            elif sl_hit:
+                exit_reason = 2
+            elif tp_hit:
+                exit_reason = 1
+
+            if exit_reason != 0:
+                if exit_reason == 2:
                     trade_pnl[trade_count] = -sl_points - total_cost
-                    entry_indices[trade_count] = entry_index
-                    exit_indices[trade_count] = i
-                    sides[trade_count] = -1
-                    exit_reasons[trade_count] = 2
-                    trade_count += 1
-                    position = 0
-                elif tp_hit:
+                else:
                     trade_pnl[trade_count] = tp_points - total_cost
-                    entry_indices[trade_count] = entry_index
-                    exit_indices[trade_count] = i
-                    sides[trade_count] = -1
-                    exit_reasons[trade_count] = 1
-                    trade_count += 1
-                    position = 0
+                entry_indices[trade_count] = entry_index
+                exit_indices[trade_count] = i
+                sides[trade_count] = 1 if is_long else -1
+                exit_reasons[trade_count] = exit_reason
+                trade_count += 1
+                position = 0
 
         # Entry at next bar open (like Pine strategy)
         if position == 0:
-            if buy_signal[i]:
+            entry_allowed = i + 1 - last_entry_index >= min_entry_gap_bars
+            if entry_allowed and buy_signal[i]:
                 position = 1
                 entry_index = i + 1
                 entry_price = open_price[i + 1]
-            elif sell_signal[i]:
+                last_entry_index = entry_index
+            elif entry_allowed and sell_signal[i]:
                 position = -1
                 entry_index = i + 1
                 entry_price = open_price[i + 1]
+                last_entry_index = entry_index
 
     return trade_pnl[:trade_count], entry_indices[:trade_count], exit_indices[:trade_count], sides[:trade_count], exit_reasons[:trade_count]
 
@@ -311,16 +377,17 @@ def calculate_metrics(pnl, exit_reasons):
 
 def run_backtest():
     print("=" * 80)
-    print("🧪 BACKTESTER - (ETH) CHAMPION - Updated Wick/Bounce")
+    print("🧪 BACKTESTER - (ETH) CHAMPION - 1-Minute Intrabar Tie-Break")
     print("=" * 80)
     print(f"\n📌 Parameters:")
-    print(f"  EMA_LENGTH:      {EMA_LENGTH}")
-    print(f"  TP_POINTS:       {TP_POINTS}")
-    print(f"  SL_POINTS:       {SL_POINTS}")
-    print(f"  CHART_TIMEFRAME: {CHART_TIMEFRAME}")
-    print(f"  MAX_WICK_RATIO:  {MAX_WICK_RATIO}")
-    print(f"  BULL_BOUNCE:     {BULL_BOUNCE_MULT}")
-    print(f"  BEAR_BOUNCE:     {BEAR_BOUNCE_MULT}")
+    print(f"  EMA_LENGTH:        {EMA_LENGTH}")
+    print(f"  TP_POINTS:         {TP_POINTS}")
+    print(f"  SL_POINTS:         {SL_POINTS}")
+    print(f"  CHART_TIMEFRAME:   {CHART_TIMEFRAME}")
+    print(f"  MAX_WICK_RATIO:    {MAX_WICK_RATIO}")
+    print(f"  BULL_BOUNCE:       {BULL_BOUNCE_MULT}")
+    print(f"  BEAR_BOUNCE:       {BEAR_BOUNCE_MULT}")
+    print(f"  USE_1M_TIE_BREAK:  {USE_1M_TIE_BREAK}")
     print("=" * 80)
 
     print("\nLoading dataset...")
@@ -330,10 +397,19 @@ def run_backtest():
     data = prepare_data(raw_data)
     buy_signal, sell_signal, close, open_price, high, low = prepare_signals(data)
 
+    print("\nMapping 1-minute candles to each 15-min bar (for tie-break)...")
+    bar_1m_start, bar_1m_end = compute_1m_bar_ranges(data.index, raw_data.index, CHART_TIMEFRAME)
+    open_1m = raw_data["open"].to_numpy()
+    high_1m = raw_data["high"].to_numpy()
+    low_1m = raw_data["low"].to_numpy()
+    close_1m = raw_data["close"].to_numpy()
+
     print("\nRunning simulation...")
     pnl, entry_indices, exit_indices, sides, exit_reasons = simulate(
         open_price, high, low, buy_signal, sell_signal,
-        TP_POINTS, SL_POINTS, TOTAL_COST
+        TP_POINTS, SL_POINTS, TOTAL_COST,
+        bar_1m_start, bar_1m_end, open_1m, high_1m, low_1m, close_1m,
+        MIN_ENTRY_GAP_BARS, USE_1M_TIE_BREAK
     )
 
     print("\nCalculating metrics...")
@@ -363,7 +439,7 @@ def run_backtest():
     print(f"  SL Hits:        {metrics['sl_hits']}")
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    trades_file = f"eth_champion_updated_backtest_EMA{EMA_LENGTH}_TP{TP_POINTS}_SL{SL_POINTS}_{ts}.csv"
+    trades_file = f"eth_champion_1mtiebreak_EMA{EMA_LENGTH}_TP{TP_POINTS}_SL{SL_POINTS}_{ts}.csv"
     trades_df.to_csv(trades_file, index=False)
     print(f"\n✅ Trades saved to: {trades_file}")
 
