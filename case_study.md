@@ -100,23 +100,23 @@ A subsequent grid sweep across EMA length, take-profit, and stop-loss — ranked
 
 | Parameter       | Value |
 | --------------- | ----- |
-| EMA Length      | 9     |
-| Take-Profit     | 351.0 pts |
-| Stop-Loss       | 141.0 pts |
+| EMA Length      | 11    |
+| Take-Profit     | 240.0 pts |
+| Stop-Loss       | 135.0 pts |
 | Chart Timeframe | 15min |
-| Reward:Risk     | 2.489 |
+| Reward:Risk     | 1.777 |
 
 **Results**
 
 | Metric        | Value           |
 | ------------- | --------------- |
-| Net Points    | 9,570.00        |
-| Total Trades  | 189             |
-| Win Rate      | 39.15%          |
-| Expectancy    | 50.63 pts/trade |
-| Profit Factor | 1.586           |
-| Max Drawdown  | 1,714.00 pts    |
-| Sharpe Ratio  | 0.215           |
+| Net Points    | 9,986.00        |
+| Total Trades  | 274             |
+| Win Rate      | 45.99%          |
+| Expectancy    | 36.45 pts/trade |
+| Profit Factor | 1.50            |
+| Max Drawdown  | 1,018.00 pts    |
+| Sharpe Ratio  | 0.198           |
 
 
 
