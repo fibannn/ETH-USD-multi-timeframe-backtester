@@ -92,7 +92,7 @@ The cause, once found, was simple: the backtest's close-based stop-loss logic re
 This single bug had been sitting underneath every verification step performed up to that point — exhaustive parameter grids, monthly consistency checks, out-of-sample testing across three years of data. None of those checks could catch it, because they were all built using the same flawed core assumption. **Only comparison against real, ground-truth execution data surfaced it.**
 
 ## 8. Where the Project Stands
-### Final configuration and results — updated (EMA 9 / TP 351 / SL 141)
+### Final configuration and results — updated (EMA 11 / TP 240 / SL 135 )
 
 A subsequent grid sweep across EMA length, take-profit, and stop-loss — ranked by net points rather than profit factor alone, and cross-checked against the profit-factor-ranked and drawdown-ranked leaderboards from the same sweep — surfaced a materially different configuration as the best-balanced result:
 
